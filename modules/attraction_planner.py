@@ -13,8 +13,9 @@ Expected user_profile keys:
     style
 
 Returned attraction item fields:
-    name, area, categories, rating, duration, best_time,
-    description, detail, image_url
+    name, area, main_category, tags, indoor_outdoor, rain_friendly,
+    rain_backup, duration_hours, best_time, rating, description, detail,
+    why_recommended, image_url
 """
 import json
 import os
@@ -35,6 +36,29 @@ USE_GEMINI = os.getenv("ATTRACTION_USE_GEMINI", "0").lower() in [
     "yes",
 ]
 CACHE_DIR = Path(__file__).resolve().parents[1] / "cache" / "attractions"
+
+MAIN_CATEGORIES = [
+    "文化歷史",
+    "購物",
+    "美食",
+    "夜景",
+    "自然",
+    "咖啡廳",
+    "室內景點",
+]
+
+FEATURE_TAGS = [
+    "拍照",
+    "雨天適合",
+    "親子",
+    "夜生活",
+    "散步",
+    "文青",
+    "購物",
+    "美食",
+    "室內",
+    "戶外",
+]
 
 
 def _safe_slug(text: str) -> str:
@@ -61,19 +85,19 @@ def get_attractions(user_profile):
 
     if not USE_GEMINI and cache_path.exists():
         with cache_path.open("r", encoding="utf-8") as f:
-            return json.load(f)
+            return normalize_attractions(json.load(f))
 
     if USE_GEMINI:
         try:
             attractions = get_attractions_from_gemini(user_profile)
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             with cache_path.open("w", encoding="utf-8") as f:
-                json.dump(attractions, f, ensure_ascii=False, indent=2)
-            return attractions
+                json.dump(normalize_attractions(attractions), f, ensure_ascii=False, indent=2)
+            return normalize_attractions(attractions)
         except Exception:
-            return get_fallback_attractions(user_profile)
+            return normalize_attractions(get_fallback_attractions(user_profile))
 
-    return get_fallback_attractions(user_profile)
+    return normalize_attractions(get_fallback_attractions(user_profile))
 
 
 def get_attractions_from_gemini(user_profile):
@@ -107,11 +131,19 @@ def get_attractions_from_gemini(user_profile):
 請只輸出 JSON array，不要 Markdown。
 
 每個景點都必須包含：
-name, area, categories, rating, duration, best_time, description, detail, image_url
+name, area, main_category, tags, indoor_outdoor, rain_friendly, rain_backup, duration_hours, best_time, rating, description, detail, why_recommended, image_url
 
-categories 必須是 array，每個景點可包含 1～3 個標籤。
-可用標籤例如：
-文化歷史、購物、美食、夜景、自然、拍照、咖啡廳、室內景點、海邊、藝術、親子
+main_category 必須只能從以下選擇一個：
+文化歷史、購物、美食、夜景、自然、咖啡廳、室內景點
+
+tags 必須是 array，每個景點可包含 1～4 個標籤。
+tags 只能從以下選擇：
+拍照、雨天適合、親子、夜生活、散步、文青、購物、美食、室內、戶外
+
+indoor_outdoor 只能填：室內、戶外、半戶外
+rain_friendly 必須是 true 或 false
+rain_backup 請填雨天可替代的景點名稱，若本身適合雨天則填空字串
+duration_hours 請填數字，例如 1.5、2、3
 
 image_url 如果沒有可靠圖片，可以回傳空字串。
 rating 請使用 4.0 到 5.0 之間的小數。
@@ -128,6 +160,69 @@ rating 請使用 4.0 到 5.0 之間的小數。
     )
 
     return json.loads(response.text)
+
+
+def normalize_main_category(raw_category):
+    text = str(raw_category or "")
+    for category in MAIN_CATEGORIES:
+        if category in text:
+            return category
+    return "文化歷史"
+
+
+def normalize_tags(raw_tags):
+    if isinstance(raw_tags, list):
+        text = " ".join(str(tag) for tag in raw_tags)
+    else:
+        text = str(raw_tags or "")
+
+    tags = []
+    for tag in FEATURE_TAGS:
+        if tag in text:
+            tags.append(tag)
+    return list(dict.fromkeys(tags))
+
+
+def normalize_attraction(item):
+    item = dict(item or {})
+    old_categories = item.get("categories", item.get("category", ""))
+    main_category = item.get("main_category") or normalize_main_category(old_categories)
+
+    tags = item.get("tags") or normalize_tags(old_categories)
+    tags = [str(tag) for tag in tags if str(tag).strip()]
+    tags = [tag for tag in dict.fromkeys(tags) if tag in FEATURE_TAGS]
+
+    indoor_outdoor = item.get("indoor_outdoor") or ""
+    if not indoor_outdoor:
+        if "室內" in tags or main_category == "室內景點":
+            indoor_outdoor = "室內"
+        elif "戶外" in tags or main_category in ["自然", "夜景"]:
+            indoor_outdoor = "戶外"
+        else:
+            indoor_outdoor = "半戶外"
+
+    rain_friendly = item.get("rain_friendly")
+    if rain_friendly is None:
+        rain_friendly = indoor_outdoor == "室內" or "雨天適合" in tags
+
+    duration_hours = item.get("duration_hours")
+    if duration_hours is None:
+        duration_text = str(item.get("duration") or "")
+        match = re.search(r"\d+(?:\.\d+)?", duration_text)
+        duration_hours = float(match.group(0)) if match else None
+
+    item["main_category"] = main_category
+    item["tags"] = tags
+    item["indoor_outdoor"] = indoor_outdoor
+    item["rain_friendly"] = bool(rain_friendly)
+    item["rain_backup"] = item.get("rain_backup") or ""
+    item["duration_hours"] = duration_hours
+    item["why_recommended"] = item.get("why_recommended") or item.get("description") or ""
+    return item
+
+
+def normalize_attractions(attractions):
+    return [normalize_attraction(item) for item in attractions or [] if isinstance(item, dict)]
 
 
 def _destination_key(user_profile: dict) -> str:

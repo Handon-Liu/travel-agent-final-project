@@ -116,7 +116,22 @@ def _dataframe_to_options(df) -> list[dict]:
             f"票價：總價 TWD {price_twd}，平均每人 TWD {price_per_person_twd}；"
             f"推薦原因：{reason}"
         )
-        options.append({"id": idx, "title": title, "detail": detail})
+        bullets = [
+            f"出發：{_format_datetime(row.get('departure_time'))}",
+            f"抵達：{_format_datetime(row.get('arrival_time'))}",
+            f"轉機：{stops} 次",
+            f"飛行時間：約 {duration_min} 分鐘",
+        ]
+        if reason:
+            bullets.append(f"推薦原因：{reason}")
+        options.append({
+            "id": idx,
+            "title": title,
+            "detail": detail,
+            "bullets": bullets,
+            "price_twd": price_twd,
+            "price_per_person_twd": price_per_person_twd,
+        })
     return options
 
 

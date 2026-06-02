@@ -39,6 +39,7 @@ from modules.trip_info_generator import run as generate_trip_info
 from modules.flight_recommender import run as recommend_flight_options
 from modules.hotel_recommender import run as recommend_hotel_options
 from modules.attraction_planner import get_attractions
+from modules.restaurant_recommender import get_dining_plan
 
 try:
     from google import genai
@@ -1224,23 +1225,29 @@ class GeminiAdaptiveTravelAgentGUI:
             if not isinstance(item, dict):
                 continue
             title = item.get("name") or item.get("title") or f"景點 {idx}"
-            categories = item.get("categories") or []
-            if isinstance(categories, list):
-                categories_text = "、".join(str(category) for category in categories if category)
+            tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+            tags_text = "、".join(str(tag) for tag in tags if tag)
+            duration_hours = item.get("duration_hours")
+            if isinstance(duration_hours, (int, float)):
+                duration_text = f"約 {duration_hours:g} 小時"
             else:
-                categories_text = str(categories)
+                duration_text = str(item.get("duration") or duration_hours or "")
 
             detail_lines = []
             if item.get("area"):
                 detail_lines.append(f"區域：{item.get('area')}")
-            if categories_text:
-                detail_lines.append(f"類型：{categories_text}")
+            if tags_text:
+                detail_lines.append(f"特色：{tags_text}")
             if item.get("rating"):
                 detail_lines.append(f"評分參考：{item.get('rating')}")
-            if item.get("duration"):
-                detail_lines.append(f"建議停留：{item.get('duration')}")
+            if duration_text:
+                detail_lines.append(f"建議停留：{duration_text}")
             if item.get("best_time"):
                 detail_lines.append(f"適合時段：{item.get('best_time')}")
+            if item.get("indoor_outdoor"):
+                detail_lines.append(f"空間類型：{item.get('indoor_outdoor')}")
+            if item.get("rain_friendly"):
+                detail_lines.append("雨天適合：是")
             if item.get("description"):
                 detail_lines.append(str(item.get("description")))
             if item.get("detail"):
@@ -1250,9 +1257,15 @@ class GeminiAdaptiveTravelAgentGUI:
                 "id": idx,
                 "title": title,
                 "detail": "\n".join(detail_lines),
-                "reason": item.get("description") or "符合目的地、住宿位置與旅行風格。",
+                "reason": item.get("why_recommended") or item.get("description") or "符合目的地、住宿位置與旅行風格。",
                 "area": item.get("area") or "",
                 "map_query": f"{destination} {title}".strip(),
+                "main_category": item.get("main_category") or "",
+                "tags": tags,
+                "indoor_outdoor": item.get("indoor_outdoor") or "",
+                "rain_friendly": bool(item.get("rain_friendly")),
+                "rain_backup": item.get("rain_backup") or "",
+                "duration_hours": item.get("duration_hours"),
             })
         return options
 
@@ -1273,6 +1286,74 @@ class GeminiAdaptiveTravelAgentGUI:
         except Exception as e:
             self.root.after(0, lambda: self.finish_error(f"產生景點選單失敗: {e}"))
 
+    def build_restaurant_user_profile(self):
+        structured_request = self.user_profile.get("structured_request") or {}
+        styles = structured_request.get("travel_style") or []
+        if isinstance(styles, list):
+            style_text = "、".join(str(item) for item in styles if item)
+        else:
+            style_text = str(styles or "")
+        destination = " ".join(
+            part
+            for part in [
+                structured_request.get("destination_country"),
+                structured_request.get("destination_city"),
+            ]
+            if part
+        ).strip()
+        selected_activity = self.user_profile.get("selected_activity", "")
+        attraction_name = selected_activity.split(" (", 1)[0].strip() if selected_activity else ""
+        attraction_pool = []
+        if attraction_name:
+            attraction_pool.append({
+                "name": attraction_name,
+                "area": destination,
+                "categories": ["已選景點"],
+            })
+        return {
+            "destination_text": f"{structured_request.get('departure_city') or ''} 出發，前往 {destination}".strip(),
+            "travel_days": structured_request.get("travel_days") or 3,
+            "confirmed_style": style_text or self.user_profile.get("confirmed_style", ""),
+            "selected_hotel": self.user_profile.get("selected_hotel", ""),
+            "attraction_pool": attraction_pool,
+        }
+
+    def dining_plan_to_single_option(self, dining_plan):
+        lines = []
+        for day in dining_plan.get("days", []):
+            lines.append(f"Day {day.get('day_number')}：{day.get('day_theme', '')}")
+            for meal_key, meal_label in [
+                ("breakfast_options", "早餐"),
+                ("lunch_options", "午餐"),
+                ("dinner_options", "晚餐"),
+            ]:
+                options = day.get(meal_key) or []
+                names = " / ".join(
+                    str(item.get("title", ""))
+                    for item in options
+                    if isinstance(item, dict) and item.get("title")
+                )
+                if names:
+                    lines.append(f"{meal_label}候選：{names}")
+        return {
+            "id": 1,
+            "title": "完整餐飲規劃",
+            "detail": "\n".join(lines) or dining_plan.get("overall_description", ""),
+            "raw": dining_plan,
+        }
+
+    def get_restaurant_options_from_module(self):
+        try:
+            dining_plan = get_dining_plan(self.build_restaurant_user_profile())
+            json_data = {
+                "description": dining_plan.get("overall_description")
+                or "以下是依照已選住宿與景點產生的完整餐飲規劃：",
+                "options": [self.dining_plan_to_single_option(dining_plan)],
+            }
+            self.root.after(0, lambda: self.render_dynamic_options("restaurant", json_data))
+        except Exception as e:
+            self.root.after(0, lambda: self.finish_error(f"產生餐飲規劃失敗: {e}"))
+
     def get_json_options_from_gemini(self, category):
         try:
             if category == "hotel":
@@ -1280,6 +1361,9 @@ class GeminiAdaptiveTravelAgentGUI:
                 return
             if category == "activity":
                 self.get_activity_options_from_module()
+                return
+            if category == "restaurant":
+                self.get_restaurant_options_from_module()
                 return
 
             if self.client is None:
