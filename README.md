@@ -38,6 +38,7 @@ Copy-Item .env.example .env
 GEMINI_API_KEY=your_gemini_api_key_here
 DUFFEL_ACCESS_TOKEN=your_duffel_access_token_here
 ATTRACTION_USE_GEMINI=0
+GOOGLE_MAPS_API_KEY=your_google_maps_api_key_here
 ```
 
 說明：
