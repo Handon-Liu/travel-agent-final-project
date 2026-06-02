@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-restaurant.py - 全旅程餐飲規劃模組（從主程式 v6.1 解耦）
+restaurant_recommender.py - 全旅程餐飲規劃模組（從主程式 v6.1 解耦）
 ========================================================
 
 📦 模組職責：
@@ -37,7 +37,7 @@ restaurant.py - 全旅程餐飲規劃模組（從主程式 v6.1 解耦）
         }
 
 🚀 用法範例：
-    from restaurant import get_dining_plan
+    from modules.restaurant_recommender import get_dining_plan
     plan = get_dining_plan(user_profile)
 
 📦 環境需求：
@@ -287,7 +287,7 @@ def get_dining_plan(user_profile: dict) -> dict:
 
 
 # ==========================================
-# 獨立測試入口（python restaurant.py）
+# 獨立測試入口（python modules/restaurant_recommender.py）
 # ==========================================
 if __name__ == "__main__":
     # 測試用 mock profile
