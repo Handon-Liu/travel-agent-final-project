@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
+import math
 import os
 import re
 import sys
@@ -23,7 +24,6 @@ if str(PROJECT_DIR) not in sys.path:
 from modules.flight_recommender import run as recommend_flight_options
 from modules.hotel_recommender import run as recommend_hotel_options
 from modules.attraction_planner import get_attractions
-from modules.restaurant_recommender import get_dining_plan
 
 
 AIRPORTS = {
@@ -255,11 +255,13 @@ def _google_maps_api_key():
     return os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_PLACES_API_KEY")
 
 
-def fetch_google_place_photo(query: str):
+def fetch_google_place_photo(query: str, max_width=640, max_height=360):
     query = str(query or "").strip()
     api_key = _google_maps_api_key()
     if not query or not api_key:
         return None
+    max_width = max(1, min(int(max_width or 640), 4800))
+    max_height = max(1, min(int(max_height or 360), 4800))
 
     search_response = requests.post(
         "https://places.googleapis.com/v1/places:searchText",
@@ -293,8 +295,8 @@ def fetch_google_place_photo(query: str):
         f"https://places.googleapis.com/v1/{photo_name}/media",
         params={
             "key": api_key,
-            "maxWidthPx": 640,
-            "maxHeightPx": 360,
+            "maxWidthPx": max_width,
+            "maxHeightPx": max_height,
         },
         timeout=20,
         allow_redirects=True,
@@ -341,6 +343,381 @@ def fetch_place_location(query: str):
         }
     except (IndexError, AttributeError, TypeError):
         return None
+
+
+def _distance_km(first, second):
+    if not isinstance(first, dict) or not isinstance(second, dict):
+        return None
+    try:
+        lat1 = math.radians(float(first.get("latitude")))
+        lon1 = math.radians(float(first.get("longitude")))
+        lat2 = math.radians(float(second.get("latitude")))
+        lon2 = math.radians(float(second.get("longitude")))
+    except (TypeError, ValueError):
+        return None
+    delta_lat = lat2 - lat1
+    delta_lon = lon2 - lon1
+    value = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2) ** 2
+    )
+    return 6371.0 * 2 * math.asin(math.sqrt(value))
+
+
+def _destination_search_context(destination, bias_radius_m=50000):
+    try:
+        place = fetch_place_location(destination)
+    except requests.RequestException:
+        place = None
+    if not place or place.get("latitude") is None or place.get("longitude") is None:
+        return None, {}
+    center = {
+        "latitude": place.get("latitude"),
+        "longitude": place.get("longitude"),
+    }
+    return center, {
+        "locationBias": {
+            "circle": {
+                "center": center,
+                "radius": float(bias_radius_m),
+            }
+        }
+    }
+
+
+def _filter_places_near_destination(places, destination_center, max_distance_km=150):
+    if not destination_center:
+        return places or []
+    nearby = []
+    for place in places or []:
+        distance = _distance_km(destination_center, place.get("location") or {})
+        if distance is not None and distance <= max_distance_km:
+            nearby.append(place)
+    return nearby
+
+
+def search_places_for_attractions(query: str, state=None):
+    query = str(query or "").strip()
+    api_key = _google_maps_api_key()
+    if not query:
+        return {"status": "error", "message": "請輸入想搜尋的景點名稱或關鍵字。"}
+    if not api_key:
+        return {"status": "error", "message": "尚未設定 GOOGLE_MAPS_API_KEY，無法即時搜尋景點。"}
+
+    structured = ((state or {}).get("structured_request") or {}) if isinstance(state, dict) else {}
+    destination = " ".join(
+        str(part)
+        for part in [structured.get("destination_country"), structured.get("destination_city")]
+        if part
+    ).strip()
+    search_text = " ".join(part for part in [destination, query] if part).strip()
+    destination_center, location_parameters = _destination_search_context(destination)
+    request_payload = {
+        "textQuery": search_text,
+        "languageCode": "zh-TW",
+        "maxResultCount": 10,
+        **location_parameters,
+    }
+
+    try:
+        response = requests.post(
+            "https://places.googleapis.com/v1/places:searchText",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": api_key,
+                "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating,places.types,places.photos,places.googleMapsUri,places.location",
+            },
+            json=request_payload,
+            timeout=20,
+        )
+    except requests.RequestException:
+        return {"status": "error", "message": "Places API 連線失敗，請稍後再試。"}
+
+    if response.status_code >= 400:
+        try:
+            error_message = response.json().get("error", {}).get("message") or response.text
+        except ValueError:
+            error_message = response.text
+        return {"status": "error", "message": f"Places API 搜尋失敗：{error_message[:180]}"}
+
+    places = _filter_places_near_destination(
+        response.json().get("places") or [],
+        destination_center,
+    )
+    attraction_items = []
+    for place in places:
+        name = ((place.get("displayName") or {}).get("text") or "").strip()
+        if not name:
+            continue
+        types = place.get("types") or []
+        tags = _tags_from_place_types(types)
+        main_category = _main_category_from_place_types(types)
+        indoor_outdoor = "室內" if "室內" in tags or main_category == "室內景點" else "半戶外"
+        if any(place_type in types for place_type in ["park", "tourist_attraction", "natural_feature"]):
+            indoor_outdoor = "戶外"
+        attraction_items.append({
+            "name": name,
+            "area": place.get("formattedAddress") or "",
+            "main_category": main_category,
+            "tags": tags,
+            "indoor_outdoor": indoor_outdoor,
+            "rain_friendly": indoor_outdoor == "室內",
+            "rain_backup": "",
+            "duration_hours": 1.5,
+            "best_time": "依營業時間與當日路線安排",
+            "rating": place.get("rating") or "",
+            "description": "這是你即時搜尋加入的景點，可和原本推薦景點一起納入後續行程規劃。",
+            "detail": f"地址：{place.get('formattedAddress') or 'Google Maps 可查詢'}",
+            "why_recommended": "使用者主動搜尋並加入行程。",
+            "image_url": "",
+            "map_query": f"{destination} {name}".strip(),
+            "google_maps_uri": place.get("googleMapsUri") or "",
+            "location": place.get("location") or {},
+        })
+
+    options = normalize_attraction_options(
+        attraction_items,
+        destination,
+        build_attraction_user_profile(state or {}),
+        limit=6,
+    )
+    for option, place_item in zip(options, attraction_items):
+        if place_item.get("google_maps_uri"):
+            option["google_maps_uri"] = place_item["google_maps_uri"]
+        option["source"] = "manual_search"
+
+    return {
+        "status": "success",
+        "description": f"以下是「{query}」的即時搜尋結果，可勾選加入行程。",
+        "options": options,
+    }
+
+
+def _main_category_from_place_types(types):
+    types = set(types or [])
+    if types & {"shopping_mall", "store", "market"}:
+        return "購物"
+    if types & {"restaurant", "cafe", "food"}:
+        return "美食"
+    if types & {"park", "natural_feature"}:
+        return "自然"
+    if types & {"museum", "art_gallery", "church", "hindu_temple", "mosque", "synagogue"}:
+        return "文化歷史"
+    if types & {"library", "aquarium", "movie_theater"}:
+        return "室內景點"
+    return "文化歷史"
+
+
+def _tags_from_place_types(types):
+    types = set(types or [])
+    tags = ["拍照"]
+    if types & {"shopping_mall", "store", "market"}:
+        tags.append("購物")
+    if types & {"restaurant", "cafe", "food"}:
+        tags.append("美食")
+    if types & {"museum", "art_gallery", "library", "aquarium", "movie_theater", "shopping_mall"}:
+        tags.extend(["室內", "雨天適合"])
+    if types & {"park", "natural_feature", "tourist_attraction"}:
+        tags.append("戶外")
+    return list(dict.fromkeys(tag for tag in tags if tag))
+
+
+def _destination_from_state(state):
+    structured = ((state or {}).get("structured_request") or {}) if isinstance(state, dict) else {}
+    return " ".join(
+        str(part)
+        for part in [structured.get("destination_country"), structured.get("destination_city")]
+        if part
+    ).strip()
+
+
+def _restaurant_tags_from_place_types(types):
+    types = set(types or [])
+    tags = ["美食"]
+    if types & {"cafe", "coffee_shop"}:
+        tags.append("咖啡")
+    if types & {"bakery", "dessert_shop"}:
+        tags.append("甜點")
+    if types & {"bar", "pub", "night_club"}:
+        tags.append("夜生活")
+    if types & {"ramen_restaurant", "japanese_restaurant", "sushi_restaurant"}:
+        tags.append("日式")
+    if types & {"korean_restaurant"}:
+        tags.append("韓式")
+    if types & {"chinese_restaurant", "taiwanese_restaurant"}:
+        tags.append("中式")
+    if types & {"seafood_restaurant"}:
+        tags.append("海鮮")
+    if types & {"breakfast_restaurant"}:
+        tags.append("早餐")
+    return list(dict.fromkeys(tag for tag in tags if tag))
+
+
+def _restaurant_price_text(price_level):
+    text = str(price_level or "").upper()
+    mapping = {
+        "PRICE_LEVEL_FREE": "免費",
+        "PRICE_LEVEL_INEXPENSIVE": "平價",
+        "PRICE_LEVEL_MODERATE": "中價位",
+        "PRICE_LEVEL_EXPENSIVE": "較高價",
+        "PRICE_LEVEL_VERY_EXPENSIVE": "高價位",
+    }
+    return mapping.get(text, "價位請參考 Google Maps")
+
+
+def normalize_restaurant_options(places, destination, limit=6):
+    options = []
+    for idx, place in enumerate((places or [])[:limit], start=1):
+        if not isinstance(place, dict):
+            continue
+        title = ((place.get("displayName") or {}).get("text") or place.get("title") or "").strip()
+        if not title:
+            continue
+        types = place.get("types") or []
+        type_set = set(types)
+        has_specific_food_type = any(str(place_type).endswith("_restaurant") for place_type in types)
+        has_specific_food_type = has_specific_food_type or bool(
+            type_set & {"restaurant", "cafe", "bakery", "meal_takeaway", "meal_delivery"}
+        )
+        if not has_specific_food_type:
+            continue
+        if (type_set & {"shopping_mall", "tourist_attraction"}) and not any(
+            str(place_type).endswith("_restaurant") for place_type in types
+        ):
+            continue
+        address = place.get("formattedAddress") or place.get("area") or ""
+        price_text = _restaurant_price_text(place.get("priceLevel") or place.get("price_level"))
+        rating = place.get("rating") or ""
+        tags = _restaurant_tags_from_place_types(types)
+        detail_lines = []
+        if address:
+            detail_lines.append(f"地址：{address}")
+        if rating:
+            detail_lines.append(f"Google 評分：{rating}")
+        detail_lines.append(f"價位：{price_text}")
+        if types:
+            detail_lines.append("類型：" + "、".join(str(item) for item in types[:5]))
+        options.append({
+            "id": idx,
+            "title": title,
+            "detail": "\n".join(detail_lines),
+            "reason": "依目的地、已選景點與 Google Places 搜尋結果推薦，適合加入美食清單後由行程模組安排鄰近路線。",
+            "area": address,
+            "map_query": f"{destination} {title}".strip(),
+            "google_maps_uri": place.get("googleMapsUri") or "",
+            "image_url": "",
+            "tags": tags,
+            "price_text": price_text,
+            "rating": rating,
+            "location": place.get("location") or {},
+            "raw": place,
+            "source": "places",
+        })
+    return options
+
+
+def search_places_for_restaurants(query: str, state=None):
+    query = str(query or "").strip()
+    api_key = _google_maps_api_key()
+    if not query:
+        return {"status": "error", "message": "請輸入想搜尋的餐廳、料理或區域。"}
+    if not api_key:
+        return {"status": "error", "message": "尚未設定 GOOGLE_MAPS_API_KEY，無法查詢餐廳。"}
+
+    destination = _destination_from_state(state)
+    search_text = " ".join(part for part in [destination, query, "餐廳 美食"] if part).strip()
+    lower_query = query.lower()
+    included_type = "restaurant"
+    if any(keyword in lower_query for keyword in ["咖啡", "coffee", "cafe", "café"]):
+        included_type = "cafe"
+    elif any(keyword in lower_query for keyword in ["甜點", "蛋糕", "麵包", "bakery", "dessert"]):
+        included_type = "bakery"
+    destination_center, location_parameters = _destination_search_context(destination)
+    request_payload = {
+        "textQuery": search_text,
+        "languageCode": "zh-TW",
+        "maxResultCount": 20,
+        "includedType": included_type,
+        "strictTypeFiltering": True,
+        **location_parameters,
+    }
+
+    try:
+        response = requests.post(
+            "https://places.googleapis.com/v1/places:searchText",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": api_key,
+                "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating,places.priceLevel,places.types,places.primaryType,places.photos,places.googleMapsUri,places.location",
+            },
+            json=request_payload,
+            timeout=20,
+        )
+    except requests.RequestException:
+        return {"status": "error", "message": "Places API 連線失敗，請稍後再試。"}
+
+    if response.status_code >= 400:
+        try:
+            error_message = response.json().get("error", {}).get("message") or response.text
+        except ValueError:
+            error_message = response.text
+        return {"status": "error", "message": f"Places API 餐廳查詢失敗：{error_message[:180]}"}
+
+    places = _filter_places_near_destination(
+        response.json().get("places") or [],
+        destination_center,
+    )
+    options = normalize_restaurant_options(places, destination, limit=6)
+    if len(options) < 6 and destination and included_type == "restaurant":
+        try:
+            fallback_response = requests.post(
+                "https://places.googleapis.com/v1/places:searchText",
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Goog-Api-Key": api_key,
+                    "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating,places.priceLevel,places.types,places.primaryType,places.photos,places.googleMapsUri,places.location",
+                },
+                json={
+                    "textQuery": f"{destination} 人氣餐廳 在地美食",
+                    "languageCode": "zh-TW",
+                    "maxResultCount": 20,
+                    "includedType": included_type,
+                    "strictTypeFiltering": True,
+                    **location_parameters,
+                },
+                timeout=20,
+            )
+            if fallback_response.status_code < 400:
+                seen = {option.get("title") for option in options}
+                fallback_places = _filter_places_near_destination(
+                    fallback_response.json().get("places") or [],
+                    destination_center,
+                )
+                for option in normalize_restaurant_options(fallback_places, destination, limit=12):
+                    if option.get("title") not in seen:
+                        seen.add(option.get("title"))
+                        options.append(option)
+                    if len(options) >= 6:
+                        break
+        except requests.RequestException:
+            pass
+    return {
+        "status": "success",
+        "description": f"以下是「{query}」的美食搜尋結果，可複選加入美食清單。",
+        "options": options,
+    }
+
+
+def recommend_restaurant_options(state):
+    structured = (state or {}).get("structured_request") or {}
+    food_preferences = structured.get("food_preferences") or {}
+    favorite_types = food_preferences.get("favorite_types") or []
+    if isinstance(favorite_types, list):
+        food_query = " ".join(str(item) for item in favorite_types if item)
+    else:
+        food_query = str(favorite_types or "")
+    query = " ".join(part for part in [food_query, "餐廳 美食"] if part).strip()
+    return search_places_for_restaurants(query or "餐廳 美食", state)
 
 
 def _parse_iso_date(value):
@@ -578,9 +955,9 @@ def _calculate_attraction_score(item, user_profile):
     return round(min(score, 9.9), 1)
 
 
-def normalize_attraction_options(attractions, destination, user_profile=None):
+def normalize_attraction_options(attractions, destination, user_profile=None, limit=6):
     options = []
-    for idx, item in enumerate((attractions or [])[:6], start=1):
+    for idx, item in enumerate((attractions or [])[:limit], start=1):
         if not isinstance(item, dict):
             continue
         title = item.get("name") or item.get("title") or f"景點 {idx}"
@@ -620,6 +997,7 @@ def normalize_attraction_options(attractions, destination, user_profile=None):
             "best_time": item.get("best_time") or "",
             "rating": item.get("rating") or "",
             "recommend_score": item.get("recommend_score") or _calculate_attraction_score(item, user_profile),
+            "location": item.get("location") or {},
             "raw": item,
         })
     return options
@@ -704,7 +1082,16 @@ def generate_options(category, state):
             ),
         }
     if category == "restaurant":
-        dining_plan = get_dining_plan(build_restaurant_user_profile(state))
+        result = recommend_restaurant_options(state)
+        if result.get("status") != "success":
+            return result
+        return {
+            "status": "success",
+            "description": result.get("description")
+            or "以下是根據目的地與已選景點推薦的美食清單，可複選加入行程。",
+            "options": result.get("options", []),
+        }
+        dining_plan = None
         return {
             "status": "success",
             "description": dining_plan.get("overall_description")
@@ -808,6 +1195,11 @@ JSON 格式必須如下：
 資料：
 {json.dumps(state, ensure_ascii=False, indent=2)}
 
+額外路線規則：
+- 已選景點與美食若有 location 或 google_maps_uri，請依地理相近性安排同一天，午餐與晚餐優先放在鄰近景點附近。
+- 若缺少精準座標，請使用 area、map_query 或地址文字做合理分區，避免讓使用者跨區折返。
+- 美食資料是候選清單，不代表固定三餐；請依每日路線順序選擇合適的餐廳插入行程。
+
 weather_context:
 {json.dumps(weather_context, ensure_ascii=False, indent=2)}
 """.strip()
@@ -840,6 +1232,94 @@ HTML = r"""<!doctype html>
       color: var(--text);
       background: var(--surface);
     }
+    [hidden] { display: none !important; }
+    .landing {
+      position: relative;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      isolation: isolate;
+      background: #0f172a center / cover no-repeat;
+    }
+    .landing::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: -2;
+      background: var(--landing-bg, linear-gradient(135deg, #0f172a, #1e293b));
+      background-size: cover;
+      background-position: center;
+      transition: background-image .7s ease-in-out;
+    }
+    .landing-overlay {
+      position: absolute;
+      inset: 0;
+      z-index: -1;
+      background:
+        linear-gradient(180deg, rgba(15, 23, 42, .22), rgba(15, 23, 42, .64)),
+        radial-gradient(circle at 50% 45%, rgba(255,255,255,.22), rgba(255,255,255,0) 34%);
+    }
+    .landing-content {
+      width: min(900px, calc(100vw - 48px));
+      color: #fff;
+      text-align: center;
+      padding: 56px 24px;
+      text-shadow: 0 2px 16px rgba(15, 23, 42, .35);
+    }
+    .landing-kicker {
+      font-size: 14px;
+      font-weight: 900;
+      letter-spacing: .18em;
+      text-transform: uppercase;
+      opacity: .86;
+      margin-bottom: 18px;
+    }
+    .landing-content h1 {
+      color: #fff;
+      font-size: clamp(44px, 7vw, 84px);
+      line-height: 1.05;
+      margin: 0 0 18px;
+    }
+    .landing-content p {
+      width: min(620px, 100%);
+      margin: 0 auto 32px;
+      font-size: 19px;
+      line-height: 1.8;
+      color: rgba(255,255,255,.92);
+    }
+    .landing-button {
+      border: 0;
+      border-radius: 999px;
+      background: #fff;
+      color: #0f172a;
+      font: inherit;
+      font-size: 20px;
+      font-weight: 900;
+      padding: 16px 34px;
+      cursor: pointer;
+      box-shadow: 0 18px 36px rgba(15, 23, 42, .28);
+      transition: transform .16s ease, box-shadow .16s ease;
+    }
+    .landing-button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 22px 46px rgba(15, 23, 42, .34);
+    }
+    .landing-dots {
+      position: absolute;
+      left: 50%;
+      bottom: 28px;
+      display: flex;
+      gap: 9px;
+      transform: translateX(-50%);
+    }
+    .landing-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.48);
+    }
+    .landing-dot.active { background: #fff; }
     .app { min-height: 100vh; display: grid; grid-template-columns: 380px 1fr; }
     aside {
       background: var(--sidebar);
@@ -976,6 +1456,33 @@ HTML = r"""<!doctype html>
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 18px;
+    }
+    .activity-search {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      margin: 12px 0 18px;
+      align-items: stretch;
+    }
+    .activity-search input {
+      margin: 0;
+      border-color: #d1d5db;
+      background: #fff;
+    }
+    .activity-search button {
+      border: 0;
+      background: var(--dark);
+      color: #fff;
+      font: inherit;
+      font-weight: 900;
+      padding: 0 18px;
+      cursor: pointer;
+    }
+    .activity-search-hint {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+      margin: -8px 0 16px;
     }
     .activity-card {
       position: relative;
@@ -1414,7 +1921,17 @@ HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-  <div class="app">
+  <section class="landing" id="landing">
+    <div class="landing-overlay"></div>
+    <div class="landing-content">
+      <div class="landing-kicker">AI Travel Planner</div>
+      <h1>AI 協作式旅遊規劃平台</h1>
+      <p>從航班、住宿、景點、美食到每日行程，讓旅程規劃更直覺也更有畫面。</p>
+      <button class="landing-button" onclick="enterApp()">開始體驗</button>
+    </div>
+    <div class="landing-dots" id="landingDots"></div>
+  </section>
+  <div class="app" id="appShell" hidden>
     <aside>
       <h2>旅遊基本資料</h2>
       <label>出發地</label>
@@ -1507,8 +2024,36 @@ HTML = r"""<!doctype html>
   <script>
     const countryCities = __COUNTRY_CITIES__;
     const state = { structured_request: null, selected: {} };
+    const landingCovers = [
+      '/api/place-photo?query=京都 清水寺 旅遊&width=1920&height=1080',
+      '/api/place-photo?query=巴黎 艾菲爾鐵塔 旅遊&width=1920&height=1080',
+      '/api/place-photo?query=首爾 景福宮 旅遊&width=1920&height=1080',
+      '/api/place-photo?query=洛杉磯 Santa Monica Pier travel&width=1920&height=1080'
+    ];
+    let landingIndex = 0;
 
     function $(id) { return document.getElementById(id); }
+    function setLandingCover(index) {
+      const landing = $('landing');
+      if (!landing) return;
+      landingIndex = index % landingCovers.length;
+      landing.style.setProperty('--landing-bg', `url("${landingCovers[landingIndex]}")`);
+      document.querySelectorAll('.landing-dot').forEach((dot, dotIndex) => {
+        dot.classList.toggle('active', dotIndex === landingIndex);
+      });
+    }
+    function initLanding() {
+      const dots = $('landingDots');
+      if (dots) {
+        dots.innerHTML = landingCovers.map((_, index) => `<span class="landing-dot ${index === 0 ? 'active' : ''}"></span>`).join('');
+      }
+      setLandingCover(0);
+      setInterval(() => setLandingCover(landingIndex + 1), 5200);
+    }
+    function enterApp() {
+      $('landing').hidden = true;
+      $('appShell').hidden = false;
+    }
     function setTab(name) {
       document.querySelectorAll('.tab').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === name));
       document.querySelectorAll('.panel').forEach(panel => panel.classList.toggle('active', panel.id === name));
@@ -1531,6 +2076,7 @@ HTML = r"""<!doctype html>
       const cities = countryCities[$('destination_country').value] || [];
       $('destination_city').innerHTML = cities.map(name => `<option>${name}</option>`).join('');
     }
+    initLanding();
     initCountries();
 
     function updateTripLengthFromDates() {
@@ -1588,12 +2134,13 @@ HTML = r"""<!doctype html>
       return String(text ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
     }
     function googleMapUrl(item) {
+      if (item.google_maps_uri) return item.google_maps_uri;
       const destination = `${state.structured_request?.destination_country || ''} ${state.structured_request?.destination_city || ''}`.trim();
       const query = item.map_query || `${item.title || ''} ${destination}`;
       return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
     }
     function supportsOptionImage(tab) {
-      return tab === 'hotel' || tab === 'activity';
+      return tab === 'hotel' || tab === 'activity' || tab === 'restaurant';
     }
     function placePhotoQuery(item) {
       const destination = `${state.structured_request?.destination_country || ''} ${state.structured_request?.destination_city || ''}`.trim();
@@ -1618,9 +2165,26 @@ HTML = r"""<!doctype html>
       img.style.display = 'none';
     }
     function isMultiSelectTab(tab) {
-      return tab === 'activity';
+      return tab === 'activity' || tab === 'restaurant';
     }
     function tagIcon(tag) {
+      const foodIcons = {
+        '美食': '🍽',
+        '咖啡': '☕',
+        '甜點': '🍰',
+        '夜生活': '🌙',
+        '日式': '🍜',
+        '韓式': '🥘',
+        '中式': '🥢',
+        '海鮮': '🦐',
+        '早餐': '🥐',
+        '平價': '💰',
+        '中價位': '💰',
+        '較高價': '💰',
+        '高價位': '💰',
+        '價位請參考 Google Maps': '💰'
+      };
+      if (foodIcons[tag]) return foodIcons[tag];
       return {
         拍照: '📷',
         雨天適合: '☔',
@@ -1636,6 +2200,10 @@ HTML = r"""<!doctype html>
       }[tag] || '標籤';
     }
     function tagClass(tag) {
+      if (['美食', '日式', '韓式', '中式', '海鮮', '早餐'].includes(tag)) return 'tag-yellow';
+      if (['咖啡', '甜點'].includes(tag)) return 'tag-pink';
+      if (['夜生活'].includes(tag)) return 'tag-purple';
+      if (['平價', '中價位', '較高價', '高價位', '價位請參考 Google Maps'].includes(tag)) return 'tag-green';
       if (['拍照', '雨天適合', '室內'].includes(tag)) return 'tag-green';
       if (['購物'].includes(tag)) return 'tag-pink';
       if (['美食'].includes(tag)) return 'tag-yellow';
@@ -1707,7 +2275,21 @@ HTML = r"""<!doctype html>
         </div>
       `;
     }
-    function renderActivityOptions(description, options) {
+    function activityOptionKey(item) {
+      return `${item.title || ''}|${item.map_query || ''}|${item.area || ''}`;
+    }
+    function restoreActivitySelection(options, selectedKeys) {
+      const selectedIndexes = new Set();
+      options.forEach((item, index) => {
+        if (selectedKeys.has(activityOptionKey(item))) selectedIndexes.add(index);
+      });
+      $('activity')._selectedIndexes = selectedIndexes;
+      document.querySelectorAll('#activity .card').forEach((card, i) => card.classList.toggle('selected', selectedIndexes.has(i)));
+      document.querySelectorAll('#activity .select-check').forEach((input, i) => { input.checked = selectedIndexes.has(i); });
+      state.selected.activity = Array.from(selectedIndexes).map(i => options[i]);
+    }
+    function renderActivityOptions(description, options, selectedKeys = null) {
+      const keysToRestore = selectedKeys || new Set((state.selected.activity || []).map(activityOptionKey));
       const cards = options.map((item, index) => {
         const imageUrl = optionImageUrl('activity', item);
         const displayTags = activityDisplayTags(item);
@@ -1741,16 +2323,155 @@ HTML = r"""<!doctype html>
       $('activity').innerHTML = `
         <h2>${heading('activity')}</h2>
         <div class="notice">${escapeHtml(description)}\n可複選多個項目。</div>
+        <div class="activity-search">
+          <input id="manualAttractionQuery" type="text" placeholder="輸入想去的景點，例如：太宰府天滿宮、博多運河城、海邊咖啡廳">
+          <button onclick="searchManualAttraction()">搜尋景點</button>
+        </div>
+        <div class="activity-search-hint">可以即時搜尋你自己想去的地點，搜尋結果會變成同款卡片，勾選後一起加入後續行程。</div>
         <div class="activity-grid">${cards || '<div class="status">目前沒有可選景點。</div>'}</div>
         <div class="action-row"><button class="secondary" onclick="confirmMultiSelection('activity')">確認景點，前往美食推薦</button></div>
       `;
       $('activity')._options = options;
+      $('activity')._description = description;
       $('activity')._selectedIndexes = new Set();
-      state.selected.activity = [];
+      restoreActivitySelection(options, keysToRestore);
       setTab('activity');
+    }
+    async function searchManualAttraction() {
+      const input = $('manualAttractionQuery');
+      const query = input?.value?.trim();
+      if (!query) {
+        alert('請輸入想搜尋的景點名稱或關鍵字。');
+        return;
+      }
+      const selectedKeys = new Set((state.selected.activity || []).map(activityOptionKey));
+      const originalText = input.value;
+      input.disabled = true;
+      try {
+        const result = await postJSON('/api/search-attraction', { query, state });
+        if (result.status !== 'success') {
+          alert(result.message || '搜尋景點失敗。');
+          return;
+        }
+        const selectedItems = Array.isArray(state.selected.activity) ? state.selected.activity : [];
+        const merged = [...selectedItems];
+        const seen = new Set(selectedItems.map(activityOptionKey));
+        for (const option of result.options || []) {
+          const key = activityOptionKey(option);
+          if (!seen.has(key)) {
+            seen.add(key);
+            merged.push(option);
+          }
+        }
+        renderActivityOptions(result.description || $('activity')._description || '以下是景點搜尋結果：', merged, selectedKeys);
+        $('manualAttractionQuery').value = originalText;
+      } catch (err) {
+        alert(err.message || '搜尋景點失敗。');
+      } finally {
+        const nextInput = $('manualAttractionQuery');
+        if (nextInput) nextInput.disabled = false;
+      }
+    }
+    function restaurantOptionKey(item) {
+      return `${item.title || ''}|${item.map_query || ''}|${item.area || ''}`;
+    }
+    function restaurantDisplayTags(item) {
+      const tags = Array.isArray(item.tags) ? item.tags : [];
+      const display = [...tags];
+      if (item.price_text && !display.includes(item.price_text)) display.push(item.price_text);
+      return [...new Set(display)].slice(0, 6);
+    }
+    function restoreRestaurantSelection(options, selectedKeys) {
+      const selectedIndexes = new Set();
+      options.forEach((item, index) => {
+        if (selectedKeys.has(restaurantOptionKey(item))) selectedIndexes.add(index);
+      });
+      $('restaurant')._selectedIndexes = selectedIndexes;
+      document.querySelectorAll('#restaurant .card').forEach((card, i) => card.classList.toggle('selected', selectedIndexes.has(i)));
+      document.querySelectorAll('#restaurant .select-check').forEach((input, i) => { input.checked = selectedIndexes.has(i); });
+      state.selected.restaurant = Array.from(selectedIndexes).map(i => options[i]);
+    }
+    function renderRestaurantOptions(description, options, selectedKeys = null) {
+      const keysToRestore = selectedKeys || new Set((state.selected.restaurant || []).map(restaurantOptionKey));
+      const cards = options.map((item, index) => {
+        const imageUrl = optionImageUrl('restaurant', item);
+        const displayTags = restaurantDisplayTags(item);
+        return `
+          <div class="card activity-card" onclick="selectOption('restaurant', ${index})">
+            ${item.rating ? `<div class="activity-score" title="Google 評分">★ ${escapeHtml(String(item.rating))}</div>` : ''}
+            ${imageUrl ? `<img class="activity-image" src="${escapeHtml(imageUrl)}" alt="${escapeHtml(item.title || '餐廳圖片')}" loading="lazy" onerror="handleImageError(this)">` : ''}
+            <div class="tag-row">${renderTagChips(displayTags.slice(0, 3))}</div>
+            <div class="card-title">${escapeHtml(item.title || `餐廳 ${index + 1}`)}</div>
+            <div class="activity-desc">${escapeHtml(item.reason || '可加入美食清單，讓行程建議依景點距離安排用餐順序。')}</div>
+            <details class="activity-detail" onclick="event.stopPropagation()">
+              <summary>詳細說明</summary>
+              <div class="activity-detail-body">${escapeHtml(item.detail || '暫無詳細說明。')}</div>
+            </details>
+            <div class="activity-actions">
+              <a class="map-link" href="${googleMapUrl(item)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Google Maps</a>
+              <label class="activity-check" onclick="event.stopPropagation()">
+                <input class="select-check" type="checkbox" onchange="selectOption('restaurant', ${index})">
+                加入美食
+              </label>
+            </div>
+          </div>
+        `;
+      }).join('');
+      $('restaurant').innerHTML = `
+        <h2>${heading('restaurant')}</h2>
+        <div class="notice">${escapeHtml(description)}\n可複選多個餐廳或美食，後續行程會依景點與美食的距離做安排。</div>
+        <div class="activity-search">
+          <input id="manualRestaurantQuery" type="text" placeholder="輸入想吃的店家、料理或區域，例如：拉麵、咖啡、壽司、天神甜點">
+          <button onclick="searchManualRestaurant()">搜尋美食</button>
+        </div>
+        <div class="activity-search-hint">搜尋結果會變成同款卡片，勾選後會一起加入美食清單。</div>
+        <div class="activity-grid">${cards || '<div class="status">目前沒有可選美食。</div>'}</div>
+        <div class="action-row"><button class="secondary" onclick="confirmMultiSelection('restaurant')">確認美食，產生行程</button></div>
+      `;
+      $('restaurant')._options = options;
+      $('restaurant')._description = description;
+      $('restaurant')._selectedIndexes = new Set();
+      restoreRestaurantSelection(options, keysToRestore);
+      setTab('restaurant');
+    }
+    async function searchManualRestaurant() {
+      const input = $('manualRestaurantQuery');
+      const query = input?.value?.trim();
+      if (!query) {
+        alert('請輸入想搜尋的餐廳、料理或區域。');
+        return;
+      }
+      const selectedKeys = new Set((state.selected.restaurant || []).map(restaurantOptionKey));
+      const originalText = input.value;
+      input.disabled = true;
+      try {
+        const result = await postJSON('/api/search-restaurant', { query, state });
+        if (result.status !== 'success') {
+          alert(result.message || '搜尋美食失敗。');
+          return;
+        }
+        const selectedItems = Array.isArray(state.selected.restaurant) ? state.selected.restaurant : [];
+        const merged = [...selectedItems];
+        const seen = new Set(selectedItems.map(restaurantOptionKey));
+        for (const option of result.options || []) {
+          const key = restaurantOptionKey(option);
+          if (!seen.has(key)) {
+            seen.add(key);
+            merged.push(option);
+          }
+        }
+        renderRestaurantOptions(result.description || $('restaurant')._description || '以下是美食搜尋結果：', merged, selectedKeys);
+        $('manualRestaurantQuery').value = originalText;
+      } catch (err) {
+        alert(err.message || '搜尋美食失敗。');
+      } finally {
+        const nextInput = $('manualRestaurantQuery');
+        if (nextInput) nextInput.disabled = false;
+      }
     }
     function renderOptions(tab, description, options) {
       if (tab === 'activity') return renderActivityOptions(description, options);
+      if (tab === 'restaurant') return renderRestaurantOptions(description, options);
       const cards = options.map((item, index) => {
         if (tab === 'flight') return renderFlightCard(item, index);
         const imageUrl = optionImageUrl(tab, item);
@@ -1800,6 +2521,20 @@ HTML = r"""<!doctype html>
       if (currency) return currency[0].trim();
       return '價位見詳細';
     }
+    function mealDisplayTitle(item, fallback) {
+      const raw = String(item.title || fallback || '').trim();
+      if (raw.length <= 24) return raw;
+      const firstChunk = raw.split(/[，。；;\n]/)[0].trim();
+      if (firstChunk && firstChunk.length <= 24) return firstChunk;
+      return `${raw.slice(0, 22)}…`;
+    }
+    function mealFullDetail(item) {
+      const title = String(item.title || '').trim();
+      const detail = String(item.detail || '').trim();
+      if (!title) return detail;
+      if (!detail) return title;
+      return `${title}\n\n${detail}`;
+    }
     function updateMealSelection(groupName, index) {
       document.querySelectorAll(`[data-meal-group="${groupName}"]`).forEach((card, i) => {
         const selected = i === index;
@@ -1822,6 +2557,8 @@ HTML = r"""<!doctype html>
             ${options.map((item, index) => {
               const imageUrl = mealImageUrl(item);
               const price = extractMealPrice(item.detail);
+              const displayTitle = mealDisplayTitle(item, `選項 ${index + 1}`);
+              const fullDetail = mealFullDetail(item);
               return `
                 <div class="meal-option-card ${index === 0 ? 'selected' : ''}" data-meal-group="${groupName}" onclick="selectMealOption('${groupName}', ${index})">
                   <input
@@ -1834,11 +2571,11 @@ HTML = r"""<!doctype html>
                     onclick="event.stopPropagation(); selectMealOption('${groupName}', ${index})"
                   >
                   ${imageUrl ? `<img class="meal-image" src="${escapeHtml(imageUrl)}" alt="${escapeHtml(item.title || '餐廳圖片')}" loading="lazy" onerror="handleImageError(this)">` : ''}
-                  <div class="meal-title">${escapeHtml(item.title || `選項 ${index + 1}`)}</div>
+                  <div class="meal-title">${escapeHtml(displayTitle)}</div>
                   <div class="meal-price">價位 ${escapeHtml(price)}</div>
                   <details class="meal-detail-summary" onclick="event.stopPropagation()">
                     <summary>詳細說明</summary>
-                    <div class="meal-detail">${escapeHtml(item.detail || '')}</div>
+                    <div class="meal-detail">${escapeHtml(fullDetail || '')}</div>
                   </details>
                   <div class="meal-actions">
                     <a class="map-link" href="${mealMapUrl(item)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Google Maps</a>
@@ -2022,6 +2759,7 @@ HTML = r"""<!doctype html>
         return;
       }
       if (tab === 'activity') return loadOptions('restaurant');
+      if (tab === 'restaurant') return loadItinerary();
     }
     function showHotelPreferenceStep() {
       const budget = $('hotel_budget_twd_per_night').value || state.structured_request?.hotel_preferences?.hotel_budget_twd_per_night || '';
@@ -2039,10 +2777,6 @@ HTML = r"""<!doctype html>
         const result = await postJSON('/api/options', { category, state });
         if (result.status !== 'success') {
           showError(category, result.message || '產生選項失敗');
-          return;
-        }
-        if (category === 'restaurant') {
-          renderDiningPlan(result.description, result.dining_plan || {});
           return;
         }
         renderOptions(category, result.description, result.options || []);
@@ -2089,8 +2823,11 @@ class TravelPlannerHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/api/place-photo":
-            query = (parse_qs(parsed.query).get("query") or [""])[0]
-            photo = fetch_google_place_photo(query)
+            params = parse_qs(parsed.query)
+            query = (params.get("query") or [""])[0]
+            width = (params.get("width") or ["640"])[0]
+            height = (params.get("height") or ["360"])[0]
+            photo = fetch_google_place_photo(query, width, height)
             if not photo:
                 self.send_error(404)
                 return
@@ -2148,6 +2885,12 @@ class TravelPlannerHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/options":
                 self._send_json(generate_options(data.get("category"), data.get("state", {})))
+                return
+            if path == "/api/search-attraction":
+                self._send_json(search_places_for_attractions(data.get("query", ""), data.get("state", {})))
+                return
+            if path == "/api/search-restaurant":
+                self._send_json(search_places_for_restaurants(data.get("query", ""), data.get("state", {})))
                 return
             if path == "/api/itinerary":
                 self._send_json(generate_itinerary(data.get("state", {})))
