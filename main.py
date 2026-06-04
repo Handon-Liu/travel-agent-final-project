@@ -292,7 +292,7 @@ class GeminiAdaptiveTravelAgentGUI:
             self.transfer_var,
             ["只要直飛", "可轉機一次", "可轉機兩次以上", "不限"],
         )
-        self._add_sidebar_entry(sidebar, "每人機票預算 TWD", self.flight_budget_var)
+        self._add_sidebar_entry(sidebar, "每人單程機票預算 TWD", self.flight_budget_var)
         self._add_sidebar_entry(sidebar, "每晚住宿預算 TWD", self.hotel_budget_var)
         self._add_sidebar_entry(sidebar, "整趟總預算 TWD", self.total_budget_var)
         self._add_sidebar_combo(
@@ -614,7 +614,7 @@ class GeminiAdaptiveTravelAgentGUI:
             f"旅遊天數：{self.days_var.get()} 天 {self.nights_var.get()} 晚\n"
             f"人數：{self.people_var.get()} 人\n"
             f"航班偏好：{self.transfer_var.get()}\n"
-            f"每人機票預算：TWD {self.flight_budget_var.get().strip()}\n"
+            f"每人單程機票預算：TWD {self.flight_budget_var.get().strip()}\n"
             f"每晚住宿預算：TWD {self.hotel_budget_var.get().strip()}\n"
             f"整趟總預算：TWD {self.total_budget_var.get().strip()}\n"
             f"行李：{self.baggage_var.get()}\n"
@@ -753,7 +753,7 @@ class GeminiAdaptiveTravelAgentGUI:
 
         if self.chat_stage == 0:
             if text.lower() in ["yes", "y", "是", "好", "沿用", "可以"]:
-                self.bot_say('好的，已沿用歷史目的地與風格。請一次告訴我：日期/天數/人數/直飛或可轉機/每人機票預算/每晚住宿預算/整趟總預算/行李。例如：2026/7/1-2026/7/7，7天，4人，可轉機一次，每人機票8000，每晚住宿3000，總預算80000，1件托運。')
+                self.bot_say('好的，已沿用歷史目的地與風格。請一次告訴我：日期/天數/人數/直飛或可轉機/每人單程機票預算/每晚住宿預算/整趟總預算/行李。例如：2026/7/1-2026/7/7，7天，4人，可轉機一次，每人單程機票8000，每晚住宿3000，總預算80000，1件托運。')
                 self.chat_stage = 3
             else:
                 self.user_profile["destination_text"] = ""
@@ -778,7 +778,7 @@ class GeminiAdaptiveTravelAgentGUI:
             self.user_profile["confirmed_style"] = text
             self.user_profile["history_requests"].append(f"Style: {text}")
             self.save_user_profile()
-            self.bot_say('風格已鎖定。請一次告訴我：日期/天數/人數/直飛或可轉機/每人機票預算/每晚住宿預算/整趟總預算/行李。例如：2026/7/1-2026/7/7，7天，4人，可轉機一次，每人機票8000，每晚住宿3000，總預算80000，1件托運。')
+            self.bot_say('風格已鎖定。請一次告訴我：日期/天數/人數/直飛或可轉機/每人單程機票預算/每晚住宿預算/整趟總預算/行李。例如：2026/7/1-2026/7/7，7天，4人，可轉機一次，每人單程機票8000，每晚住宿3000，總預算80000，1件托運。')
             self.chat_stage = 3
             return
 
@@ -875,7 +875,7 @@ class GeminiAdaptiveTravelAgentGUI:
             "【航班需求】",
             f"- 直飛 / 轉機：{transfer_text}",
             f"- 偏好出發時段：{flight.get('preferred_departure_time') or '不限'}",
-            f"- 每人機票預算：{self._format_twd(flight.get('flight_budget_twd_per_person'))}",
+            f"- 每人單程機票預算：{self._format_twd(flight.get('flight_budget_twd_per_person'))}",
             f"- 行李需求：{sr.get('baggage') or '未指定'}",
             "",
             "【住宿需求】",
@@ -915,7 +915,7 @@ class GeminiAdaptiveTravelAgentGUI:
             "travel_style": "旅行風格",
             "baggage": "行李需求",
             "flight_transfer_preference": "直飛或轉機偏好",
-            "flight_budget_twd_per_person": "每人機票預算",
+            "flight_budget_twd_per_person": "每人單程機票預算",
             "hotel_budget": "住宿預算",
         }
         return labels.get(field, field)
@@ -1000,7 +1000,7 @@ class GeminiAdaptiveTravelAgentGUI:
         self.awaiting_structured_followup = True
         self.chat_stage = 3
         self.bot_say(
-            "好的，請直接輸入要修改或補充的內容。例如：改成只要直飛、每人機票預算提高到 12000、住宿每晚改 4000、總預算改 90000。"
+            "好的，請直接輸入要修改或補充的內容。例如：改成只要直飛、每人單程機票預算提高到 12000、住宿每晚改 4000、總預算改 90000。"
         )
 
     def generate_structured_trip_request(self):
@@ -1105,7 +1105,7 @@ class GeminiAdaptiveTravelAgentGUI:
             self.bot_say(f"目前還不能查航班：{message}")
         else:
             self.bot_say(f"❌ 航班推薦失敗：{message}")
-            self.bot_say("如果要調整條件，請輸入「修改」，例如提高每人機票預算、改成可轉機，或換日期。")
+            self.bot_say("如果要調整條件，請輸入「修改」，例如提高每人單程機票預算、改成可轉機，或換日期。")
 
     # -----------------------------
     # User option selection handling

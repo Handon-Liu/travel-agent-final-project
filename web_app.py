@@ -196,7 +196,7 @@ def missing_fields(structured):
         "end_date": "回程日",
         "travel_days": "天數",
         "people": "人數",
-        "flight_budget_twd_per_person": "每人機票預算",
+        "flight_budget_twd_per_person": "每人單程機票預算",
         "hotel_budget_twd_per_night": "每晚住宿預算",
         "total_budget_twd": "整趟總預算",
     }
@@ -223,7 +223,7 @@ def summary_text(structured):
         f"目的地：{structured.get('destination_country')} {structured.get('destination_city')}（{structured.get('arrival_airport')}）",
         f"日期：{structured.get('start_date')} 至 {structured.get('end_date')}，{structured.get('travel_days')} 天 {structured.get('nights')} 晚",
         f"人數：{structured.get('people')} 人",
-        f"航班：{flight.get('transfer_preference')}，每人機票預算 TWD {flight.get('flight_budget_twd_per_person')}",
+        f"航班：{flight.get('transfer_preference')}，每人單程機票預算 TWD {flight.get('flight_budget_twd_per_person')}",
         f"住宿：每晚 TWD {hotel.get('hotel_budget_twd_per_night')}",
         f"總預算：TWD {structured.get('total_budget_twd')}",
         f"行李：{structured.get('baggage')}",
@@ -567,7 +567,7 @@ def _restaurant_price_text(price_level):
 
 def normalize_restaurant_options(places, destination, limit=6):
     options = []
-    for idx, place in enumerate((places or [])[:limit], start=1):
+    for place in places or []:
         if not isinstance(place, dict):
             continue
         title = ((place.get("displayName") or {}).get("text") or place.get("title") or "").strip()
@@ -588,17 +588,20 @@ def normalize_restaurant_options(places, destination, limit=6):
         address = place.get("formattedAddress") or place.get("area") or ""
         price_text = _restaurant_price_text(place.get("priceLevel") or place.get("price_level"))
         rating = place.get("rating") or ""
+        review_count = place.get("userRatingCount") or place.get("review_count") or 0
         tags = _restaurant_tags_from_place_types(types)
         detail_lines = []
         if address:
             detail_lines.append(f"地址：{address}")
         if rating:
             detail_lines.append(f"Google 評分：{rating}")
+        if review_count:
+            detail_lines.append(f"Google 評論數：{review_count:,}")
         detail_lines.append(f"價位：{price_text}")
         if types:
             detail_lines.append("類型：" + "、".join(str(item) for item in types[:5]))
         options.append({
-            "id": idx,
+            "id": len(options) + 1,
             "title": title,
             "detail": "\n".join(detail_lines),
             "reason": "依目的地、已選景點與 Google Places 搜尋結果推薦，適合加入美食清單後由行程模組安排鄰近路線。",
@@ -608,11 +611,15 @@ def normalize_restaurant_options(places, destination, limit=6):
             "image_url": "",
             "tags": tags,
             "price_text": price_text,
+            "price_level": place.get("priceLevel") or place.get("price_level") or "",
             "rating": rating,
+            "review_count": review_count,
             "location": place.get("location") or {},
             "raw": place,
             "source": "places",
         })
+        if len(options) >= limit:
+            break
     return options
 
 
@@ -648,7 +655,7 @@ def search_places_for_restaurants(query: str, state=None):
             headers={
                 "Content-Type": "application/json",
                 "X-Goog-Api-Key": api_key,
-                "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating,places.priceLevel,places.types,places.primaryType,places.photos,places.googleMapsUri,places.location",
+                "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.priceLevel,places.types,places.primaryType,places.photos,places.googleMapsUri,places.location",
             },
             json=request_payload,
             timeout=20,
@@ -667,15 +674,15 @@ def search_places_for_restaurants(query: str, state=None):
         response.json().get("places") or [],
         destination_center,
     )
-    options = normalize_restaurant_options(places, destination, limit=6)
-    if len(options) < 6 and destination and included_type == "restaurant":
+    options = normalize_restaurant_options(places, destination, limit=20)
+    if len(options) < 20 and destination and included_type == "restaurant":
         try:
             fallback_response = requests.post(
                 "https://places.googleapis.com/v1/places:searchText",
                 headers={
                     "Content-Type": "application/json",
                     "X-Goog-Api-Key": api_key,
-                    "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating,places.priceLevel,places.types,places.primaryType,places.photos,places.googleMapsUri,places.location",
+                    "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.priceLevel,places.types,places.primaryType,places.photos,places.googleMapsUri,places.location",
                 },
                 json={
                     "textQuery": f"{destination} 人氣餐廳 在地美食",
@@ -693,11 +700,11 @@ def search_places_for_restaurants(query: str, state=None):
                     fallback_response.json().get("places") or [],
                     destination_center,
                 )
-                for option in normalize_restaurant_options(fallback_places, destination, limit=12):
+                for option in normalize_restaurant_options(fallback_places, destination, limit=20):
                     if option.get("title") not in seen:
                         seen.add(option.get("title"))
                         options.append(option)
-                    if len(options) >= 6:
+                    if len(options) >= 20:
                         break
         except requests.RequestException:
             pass
@@ -1261,7 +1268,7 @@ HTML = r"""<!doctype html>
         radial-gradient(circle at 50% 45%, rgba(255,255,255,.22), rgba(255,255,255,0) 34%);
     }
     .landing-content {
-      width: min(900px, calc(100vw - 48px));
+      width: min(1280px, calc(100vw - 48px));
       color: #fff;
       text-align: center;
       padding: 56px 24px;
@@ -1277,9 +1284,11 @@ HTML = r"""<!doctype html>
     }
     .landing-content h1 {
       color: #fff;
-      font-size: clamp(44px, 7vw, 84px);
+      font-size: clamp(44px, 6vw, 78px);
       line-height: 1.05;
       margin: 0 0 18px;
+      white-space: nowrap;
+      word-break: keep-all;
     }
     .landing-content p {
       width: min(620px, 100%);
@@ -1333,6 +1342,12 @@ HTML = r"""<!doctype html>
     h2 { font-size: 30px; margin: 0 0 20px; }
     h3 { margin: 0 0 14px; }
     label { display: block; font-size: 14px; margin: 15px 0 7px; }
+    .field-hint {
+      margin: 6px 0 0;
+      color: #667085;
+      font-size: 12px;
+      line-height: 1.55;
+    }
     input, select, textarea {
       width: 100%;
       border: 1px solid transparent;
@@ -1483,6 +1498,56 @@ HTML = r"""<!doctype html>
       font-size: 14px;
       line-height: 1.6;
       margin: -8px 0 16px;
+    }
+    .restaurant-filters {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 0 0 18px;
+      padding: 14px;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+    }
+    .restaurant-filter label {
+      margin: 0 0 6px;
+      color: #475467;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .restaurant-filter select {
+      border-color: #d1d5db;
+      padding: 9px 10px;
+    }
+    .restaurant-result-meta {
+      margin: 0 0 12px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .pagination {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      margin: 20px 0 4px;
+    }
+    .pagination button {
+      min-width: 38px;
+      min-height: 38px;
+      border: 1px solid #d1d5db;
+      background: #fff;
+      color: #344054;
+      cursor: pointer;
+      font: inherit;
+      font-weight: 800;
+    }
+    .pagination button.active {
+      border-color: var(--blue);
+      background: var(--blue);
+      color: #fff;
+    }
+    .pagination button:disabled {
+      opacity: .4;
+      cursor: not-allowed;
     }
     .activity-card {
       position: relative;
@@ -1790,6 +1855,26 @@ HTML = r"""<!doctype html>
       gap: 10px;
       margin-top: 18px;
     }
+    .itinerary-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+    .itinerary-toolbar h2 {
+      margin: 0;
+    }
+    .download-itinerary-button {
+      border: 1px solid var(--dark);
+      background: var(--dark);
+      color: #fff;
+      font: inherit;
+      font-weight: 800;
+      padding: 11px 16px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
     .itinerary-layout {
       display: grid;
       gap: 16px;
@@ -1874,10 +1959,48 @@ HTML = r"""<!doctype html>
     }
     .timeline-item {
       display: grid;
-      grid-template-columns: 76px 1fr;
+      grid-template-columns: 28px 76px 1fr;
       gap: 12px;
       border-top: 1px solid #eef2f7;
       padding-top: 10px;
+      cursor: grab;
+    }
+    .timeline-item:active { cursor: grabbing; }
+    .timeline-item.dragging {
+      opacity: .45;
+      background: #eff6ff;
+    }
+    .timeline-item.drag-over {
+      border-top: 3px solid var(--blue);
+    }
+    .timeline-drop-zone {
+      min-height: 36px;
+      border: 1px dashed #cbd5e1;
+      padding: 8px 10px;
+      color: #64748b;
+      font-size: 13px;
+      text-align: center;
+    }
+    .timeline-drop-zone.drag-over {
+      border-color: var(--blue);
+      background: #eff6ff;
+      color: #0f4c81;
+    }
+    .drag-handle {
+      color: #98a2b3;
+      font-size: 20px;
+      font-weight: 900;
+      line-height: 1;
+      user-select: none;
+    }
+    .itinerary-edit-hint {
+      margin: 0 0 14px;
+      padding: 10px 12px;
+      color: #475467;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      font-size: 14px;
+      line-height: 1.6;
     }
     .timeline-item:first-child {
       border-top: 0;
@@ -1896,6 +2019,10 @@ HTML = r"""<!doctype html>
       line-height: 1.65;
     }
     @media (max-width: 960px) {
+      .landing-content h1 {
+        font-size: clamp(32px, 8vw, 54px);
+        white-space: normal;
+      }
       .app { grid-template-columns: 1fr; }
       aside, main { height: auto; }
       h1 { font-size: 34px; }
@@ -1911,11 +2038,14 @@ HTML = r"""<!doctype html>
         text-align: left;
       }
       .activity-grid { grid-template-columns: 1fr; }
+      .restaurant-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .activity-image { height: 160px; }
       .activity-actions { grid-template-columns: 1fr; }
       .activity-check { justify-content: flex-start; }
       .itinerary-grid { grid-template-columns: 1fr; }
-      .timeline-item { grid-template-columns: 1fr; }
+      .itinerary-toolbar { align-items: stretch; flex-direction: column; }
+      .timeline-item { grid-template-columns: 24px 1fr; }
+      .timeline-item .time-chip { grid-column: 2; }
       .meal-grid { grid-template-columns: 1fr; }
     }
   </style>
@@ -1958,8 +2088,9 @@ HTML = r"""<!doctype html>
         <option>可轉機兩次以上</option>
         <option>不限</option>
       </select>
-      <label>每人機票預算 TWD</label>
+      <label>每人單程機票預算 TWD</label>
       <input id="flight_budget_twd_per_person" type="number" value="8000">
+      <p class="field-hint">目前航班推薦查詢的是去程單程票價，請填寫每位旅客「單程」可接受的最高預算；回程票價尚未納入此欄位。</p>
       <label>每晚住宿預算 TWD</label>
       <input id="hotel_budget_twd_per_night" type="number" value="4000">
       <div class="side-section">
@@ -2023,7 +2154,16 @@ HTML = r"""<!doctype html>
   </div>
   <script>
     const countryCities = __COUNTRY_CITIES__;
-    const state = { structured_request: null, selected: {} };
+    const state = { structured_request: null, selected: {}, itinerary: null };
+    const restaurantUI = {
+      page: 1,
+      pageSize: 6,
+      minRating: 0,
+      minReviews: 0,
+      priceLevel: 'all',
+      sortBy: 'rating'
+    };
+    let draggedItineraryItem = null;
     const landingCovers = [
       '/api/place-photo?query=京都 清水寺 旅遊&width=1920&height=1080',
       '/api/place-photo?query=巴黎 艾菲爾鐵塔 旅遊&width=1920&height=1080',
@@ -2258,7 +2398,7 @@ HTML = r"""<!doctype html>
         ? item.bullets
         : String(item.detail || '').split(/[；;]/).map(text => text.trim()).filter(Boolean);
       const totalPrice = item.price_twd ? `TWD ${escapeHtml(item.price_twd)}` : '';
-      const perPersonPrice = item.price_per_person_twd ? `平均每人 TWD ${escapeHtml(item.price_per_person_twd)}` : '';
+      const perPersonPrice = item.price_per_person_twd ? `單程每人 TWD ${escapeHtml(item.price_per_person_twd)}` : '';
       return `
         <div class="card flight-card" onclick="selectOption('flight', ${index})">
           <div class="flight-main">
@@ -2268,7 +2408,7 @@ HTML = r"""<!doctype html>
             </ul>
           </div>
           <div class="flight-price">
-            <div class="flight-price-label">票價</div>
+            <div class="flight-price-label">單程總價</div>
             <div class="flight-price-total">${totalPrice || '待確認'}</div>
             ${perPersonPrice ? `<div class="flight-price-sub">${perPersonPrice}</div>` : ''}
           </div>
@@ -2381,59 +2521,6 @@ HTML = r"""<!doctype html>
       if (item.price_text && !display.includes(item.price_text)) display.push(item.price_text);
       return [...new Set(display)].slice(0, 6);
     }
-    function restoreRestaurantSelection(options, selectedKeys) {
-      const selectedIndexes = new Set();
-      options.forEach((item, index) => {
-        if (selectedKeys.has(restaurantOptionKey(item))) selectedIndexes.add(index);
-      });
-      $('restaurant')._selectedIndexes = selectedIndexes;
-      document.querySelectorAll('#restaurant .card').forEach((card, i) => card.classList.toggle('selected', selectedIndexes.has(i)));
-      document.querySelectorAll('#restaurant .select-check').forEach((input, i) => { input.checked = selectedIndexes.has(i); });
-      state.selected.restaurant = Array.from(selectedIndexes).map(i => options[i]);
-    }
-    function renderRestaurantOptions(description, options, selectedKeys = null) {
-      const keysToRestore = selectedKeys || new Set((state.selected.restaurant || []).map(restaurantOptionKey));
-      const cards = options.map((item, index) => {
-        const imageUrl = optionImageUrl('restaurant', item);
-        const displayTags = restaurantDisplayTags(item);
-        return `
-          <div class="card activity-card" onclick="selectOption('restaurant', ${index})">
-            ${item.rating ? `<div class="activity-score" title="Google 評分">★ ${escapeHtml(String(item.rating))}</div>` : ''}
-            ${imageUrl ? `<img class="activity-image" src="${escapeHtml(imageUrl)}" alt="${escapeHtml(item.title || '餐廳圖片')}" loading="lazy" onerror="handleImageError(this)">` : ''}
-            <div class="tag-row">${renderTagChips(displayTags.slice(0, 3))}</div>
-            <div class="card-title">${escapeHtml(item.title || `餐廳 ${index + 1}`)}</div>
-            <div class="activity-desc">${escapeHtml(item.reason || '可加入美食清單，讓行程建議依景點距離安排用餐順序。')}</div>
-            <details class="activity-detail" onclick="event.stopPropagation()">
-              <summary>詳細說明</summary>
-              <div class="activity-detail-body">${escapeHtml(item.detail || '暫無詳細說明。')}</div>
-            </details>
-            <div class="activity-actions">
-              <a class="map-link" href="${googleMapUrl(item)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Google Maps</a>
-              <label class="activity-check" onclick="event.stopPropagation()">
-                <input class="select-check" type="checkbox" onchange="selectOption('restaurant', ${index})">
-                加入美食
-              </label>
-            </div>
-          </div>
-        `;
-      }).join('');
-      $('restaurant').innerHTML = `
-        <h2>${heading('restaurant')}</h2>
-        <div class="notice">${escapeHtml(description)}\n可複選多個餐廳或美食，後續行程會依景點與美食的距離做安排。</div>
-        <div class="activity-search">
-          <input id="manualRestaurantQuery" type="text" placeholder="輸入想吃的店家、料理或區域，例如：拉麵、咖啡、壽司、天神甜點">
-          <button onclick="searchManualRestaurant()">搜尋美食</button>
-        </div>
-        <div class="activity-search-hint">搜尋結果會變成同款卡片，勾選後會一起加入美食清單。</div>
-        <div class="activity-grid">${cards || '<div class="status">目前沒有可選美食。</div>'}</div>
-        <div class="action-row"><button class="secondary" onclick="confirmMultiSelection('restaurant')">確認美食，產生行程</button></div>
-      `;
-      $('restaurant')._options = options;
-      $('restaurant')._description = description;
-      $('restaurant')._selectedIndexes = new Set();
-      restoreRestaurantSelection(options, keysToRestore);
-      setTab('restaurant');
-    }
     async function searchManualRestaurant() {
       const input = $('manualRestaurantQuery');
       const query = input?.value?.trim();
@@ -2460,6 +2547,7 @@ HTML = r"""<!doctype html>
             merged.push(option);
           }
         }
+        $('restaurant')._query = originalText;
         renderRestaurantOptions(result.description || $('restaurant')._description || '以下是美食搜尋結果：', merged, selectedKeys);
         $('manualRestaurantQuery').value = originalText;
       } catch (err) {
@@ -2468,6 +2556,120 @@ HTML = r"""<!doctype html>
         const nextInput = $('manualRestaurantQuery');
         if (nextInput) nextInput.disabled = false;
       }
+    }
+    function selectedRestaurantKeys() {
+      return new Set((state.selected.restaurant || []).map(restaurantOptionKey));
+    }
+    function filteredRestaurantEntries(options) {
+      const selectedKeys = selectedRestaurantKeys();
+      const entries = options.map((item, index) => ({ item, index })).filter(({ item }) => {
+        if (selectedKeys.has(restaurantOptionKey(item))) return true;
+        const rating = Number(item.rating || 0);
+        const reviews = Number(item.review_count || 0);
+        const priceMatches = restaurantUI.priceLevel === 'all' || item.price_level === restaurantUI.priceLevel;
+        return rating >= restaurantUI.minRating && reviews >= restaurantUI.minReviews && priceMatches;
+      });
+      entries.sort((left, right) => {
+        const leftSelected = selectedKeys.has(restaurantOptionKey(left.item)) ? 1 : 0;
+        const rightSelected = selectedKeys.has(restaurantOptionKey(right.item)) ? 1 : 0;
+        if (leftSelected !== rightSelected) return rightSelected - leftSelected;
+        if (restaurantUI.sortBy === 'reviews') return Number(right.item.review_count || 0) - Number(left.item.review_count || 0);
+        if (restaurantUI.sortBy === 'name') return String(left.item.title || '').localeCompare(String(right.item.title || ''), 'zh-Hant');
+        return Number(right.item.rating || 0) - Number(left.item.rating || 0);
+      });
+      return entries;
+    }
+    function updateRestaurantFilters() {
+      restaurantUI.minRating = Number($('restaurantMinRating')?.value || 0);
+      restaurantUI.minReviews = Number($('restaurantMinReviews')?.value || 0);
+      restaurantUI.priceLevel = $('restaurantPriceLevel')?.value || 'all';
+      restaurantUI.sortBy = $('restaurantSortBy')?.value || 'rating';
+      restaurantUI.page = 1;
+      renderRestaurantPage();
+    }
+    function goToRestaurantPage(page) {
+      restaurantUI.page = page;
+      renderRestaurantPage();
+    }
+    function selectRestaurantOption(index) {
+      const options = $('restaurant')._options || [];
+      const item = options[index];
+      if (!item) return;
+      const key = restaurantOptionKey(item);
+      const selectedKeys = selectedRestaurantKeys();
+      if (selectedKeys.has(key)) selectedKeys.delete(key);
+      else selectedKeys.add(key);
+      state.selected.restaurant = options.filter(option => selectedKeys.has(restaurantOptionKey(option)));
+      renderRestaurantPage();
+    }
+    function renderRestaurantPage() {
+      const options = $('restaurant')._options || [];
+      const description = $('restaurant')._description || '';
+      const query = $('restaurant')._query || '';
+      const selectedKeys = selectedRestaurantKeys();
+      const filtered = filteredRestaurantEntries(options);
+      const totalPages = Math.max(1, Math.ceil(filtered.length / restaurantUI.pageSize));
+      restaurantUI.page = Math.min(Math.max(1, restaurantUI.page), totalPages);
+      const start = (restaurantUI.page - 1) * restaurantUI.pageSize;
+      const pageEntries = filtered.slice(start, start + restaurantUI.pageSize);
+      const cards = pageEntries.map(({ item, index }) => {
+        const imageUrl = optionImageUrl('restaurant', item);
+        const displayTags = restaurantDisplayTags(item);
+        const isSelected = selectedKeys.has(restaurantOptionKey(item));
+        return `
+          <div class="card activity-card ${isSelected ? 'selected' : ''}" onclick="selectRestaurantOption(${index})">
+            ${item.rating ? `<div class="activity-score" title="Google 評分">★ ${escapeHtml(String(item.rating))}</div>` : ''}
+            ${imageUrl ? `<img class="activity-image" src="${escapeHtml(imageUrl)}" alt="${escapeHtml(item.title || '餐廳圖片')}" loading="lazy" onerror="handleImageError(this)">` : ''}
+            <div class="tag-row">${renderTagChips(displayTags.slice(0, 3))}</div>
+            <div class="card-title">${escapeHtml(item.title || `餐廳 ${index + 1}`)}</div>
+            <div class="restaurant-result-meta">${item.review_count ? `${escapeHtml(Number(item.review_count).toLocaleString())} 則 Google 評論` : '評論數未提供'} · ${escapeHtml(item.price_text || '價位未提供')}</div>
+            <div class="activity-desc">${escapeHtml(item.reason || '可加入美食清單，讓行程建議依景點距離安排用餐順序。')}</div>
+            <details class="activity-detail" onclick="event.stopPropagation()">
+              <summary>詳細說明</summary>
+              <div class="activity-detail-body">${escapeHtml(item.detail || '暫無詳細說明。')}</div>
+            </details>
+            <div class="activity-actions">
+              <a class="map-link" href="${googleMapUrl(item)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Google Maps</a>
+              <label class="activity-check" onclick="event.stopPropagation()">
+                <input class="select-check" type="checkbox" ${isSelected ? 'checked' : ''} onchange="selectRestaurantOption(${index})">
+                加入美食
+              </label>
+            </div>
+          </div>
+        `;
+      }).join('');
+      const pageButtons = Array.from({ length: totalPages }, (_, index) => {
+        const page = index + 1;
+        return `<button class="${page === restaurantUI.page ? 'active' : ''}" onclick="goToRestaurantPage(${page})">${page}</button>`;
+      }).join('');
+      $('restaurant').innerHTML = `
+        <h2>${heading('restaurant')}</h2>
+        <div class="notice">${escapeHtml(description)}\n可複選多間餐廳，後續行程會依景點與美食距離安排。</div>
+        <div class="activity-search">
+          <input id="manualRestaurantQuery" type="text" value="${escapeHtml(query)}" placeholder="輸入店家、料理或區域，例如：拉麵、咖啡、壽司">
+          <button onclick="searchManualRestaurant()">搜尋美食</button>
+        </div>
+        <div class="activity-search-hint">沒有頭緒時，可依星數、Google 評論數與價位篩選。已加入清單的餐廳會固定保留。</div>
+        <div class="restaurant-filters">
+          <div class="restaurant-filter"><label>最低星數</label><select id="restaurantMinRating" onchange="updateRestaurantFilters()"><option value="0" ${restaurantUI.minRating === 0 ? 'selected' : ''}>不限</option><option value="4" ${restaurantUI.minRating === 4 ? 'selected' : ''}>4.0 星以上</option><option value="4.3" ${restaurantUI.minRating === 4.3 ? 'selected' : ''}>4.3 星以上</option><option value="4.5" ${restaurantUI.minRating === 4.5 ? 'selected' : ''}>4.5 星以上</option></select></div>
+          <div class="restaurant-filter"><label>最低評論數</label><select id="restaurantMinReviews" onchange="updateRestaurantFilters()"><option value="0" ${restaurantUI.minReviews === 0 ? 'selected' : ''}>不限</option><option value="100" ${restaurantUI.minReviews === 100 ? 'selected' : ''}>100 則以上</option><option value="500" ${restaurantUI.minReviews === 500 ? 'selected' : ''}>500 則以上</option><option value="1000" ${restaurantUI.minReviews === 1000 ? 'selected' : ''}>1,000 則以上</option></select></div>
+          <div class="restaurant-filter"><label>價位</label><select id="restaurantPriceLevel" onchange="updateRestaurantFilters()"><option value="all" ${restaurantUI.priceLevel === 'all' ? 'selected' : ''}>不限</option><option value="PRICE_LEVEL_INEXPENSIVE" ${restaurantUI.priceLevel === 'PRICE_LEVEL_INEXPENSIVE' ? 'selected' : ''}>平價</option><option value="PRICE_LEVEL_MODERATE" ${restaurantUI.priceLevel === 'PRICE_LEVEL_MODERATE' ? 'selected' : ''}>中價位</option><option value="PRICE_LEVEL_EXPENSIVE" ${restaurantUI.priceLevel === 'PRICE_LEVEL_EXPENSIVE' ? 'selected' : ''}>較高價</option></select></div>
+          <div class="restaurant-filter"><label>排序</label><select id="restaurantSortBy" onchange="updateRestaurantFilters()"><option value="rating" ${restaurantUI.sortBy === 'rating' ? 'selected' : ''}>星數最高</option><option value="reviews" ${restaurantUI.sortBy === 'reviews' ? 'selected' : ''}>評論最多</option><option value="name" ${restaurantUI.sortBy === 'name' ? 'selected' : ''}>店名排序</option></select></div>
+        </div>
+        <div class="restaurant-result-meta">符合條件 ${filtered.length} 間 · 第 ${restaurantUI.page} / ${totalPages} 頁 · 每頁最多 ${restaurantUI.pageSize} 間</div>
+        <div class="activity-grid">${cards || '<div class="status">沒有符合目前篩選條件的美食，請放寬星數、評論數或價位條件。</div>'}</div>
+        <div class="pagination"><button onclick="goToRestaurantPage(${restaurantUI.page - 1})" ${restaurantUI.page <= 1 ? 'disabled' : ''}>‹</button>${pageButtons}<button onclick="goToRestaurantPage(${restaurantUI.page + 1})" ${restaurantUI.page >= totalPages ? 'disabled' : ''}>›</button></div>
+        <div class="action-row"><button class="secondary" onclick="confirmMultiSelection('restaurant')">確認美食，產生行程</button></div>
+      `;
+      setTab('restaurant');
+    }
+    function renderRestaurantOptions(description, options, selectedKeys = null) {
+      if (selectedKeys) state.selected.restaurant = options.filter(option => selectedKeys.has(restaurantOptionKey(option)));
+      if (!selectedKeys) $('restaurant')._query = '';
+      $('restaurant')._options = options;
+      $('restaurant')._description = description;
+      restaurantUI.page = 1;
+      renderRestaurantPage();
     }
     function renderOptions(tab, description, options) {
       if (tab === 'activity') return renderActivityOptions(description, options);
@@ -2671,6 +2873,132 @@ HTML = r"""<!doctype html>
         </section>
       `;
     }
+    function downloadListHtml(title, items) {
+      const rows = Array.isArray(items) ? items : [];
+      if (!rows.length) return '';
+      return `
+        <section>
+          <h2>${escapeHtml(title)}</h2>
+          <ul>${rows.map(item => `<li>${escapeHtml(String(item || ''))}</li>`).join('')}</ul>
+        </section>
+      `;
+    }
+    function downloadItinerary() {
+      const itinerary = state.itinerary;
+      if (!itinerary) {
+        alert('目前沒有可下載的行程。');
+        return;
+      }
+      const structured = state.structured_request || {};
+      const destination = structured.destination_city || structured.destination_country || '旅遊';
+      const startDate = structured.start_date || '';
+      const endDate = structured.end_date || '';
+      const safeFileName = `${destination}-${startDate || '行程表'}`.replace(/[\\/:*?"<>|]/g, '-');
+      if (typeof itinerary === 'string') {
+        const simpleHtml = `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><title>${escapeHtml(destination)}行程表</title><style>body{font-family:Arial,"Microsoft JhengHei",sans-serif;max-width:900px;margin:40px auto;padding:0 24px;line-height:1.8;color:#172033;white-space:pre-wrap}h1{border-bottom:3px solid #172033;padding-bottom:12px}@media print{body{margin:0;max-width:none}}</style></head><body><h1>${escapeHtml(destination)}行程表</h1>${escapeHtml(cleanItineraryText(itinerary))}</body></html>`;
+        const simpleBlob = new Blob([simpleHtml], { type: 'text/html;charset=utf-8' });
+        const simpleUrl = URL.createObjectURL(simpleBlob);
+        const simpleLink = document.createElement('a');
+        simpleLink.href = simpleUrl;
+        simpleLink.download = `${safeFileName}.html`;
+        simpleLink.click();
+        setTimeout(() => URL.revokeObjectURL(simpleUrl), 1000);
+        return;
+      }
+      const days = Array.isArray(itinerary.days) ? itinerary.days : [];
+      const selectedPlan = Array.isArray(itinerary.selected_plan) ? itinerary.selected_plan : [];
+      const html = `<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(destination)}行程表</title>
+  <style>
+    *{box-sizing:border-box}body{font-family:Arial,"Microsoft JhengHei",sans-serif;max-width:1000px;margin:36px auto;padding:0 24px;color:#172033;line-height:1.65;background:#fff}
+    header{border-bottom:4px solid #172033;padding-bottom:18px;margin-bottom:24px}h1{margin:0 0 8px;font-size:32px}h2{font-size:20px;margin:0 0 12px}h3{font-size:18px;margin:0}.subtitle,.meta,.note{color:#526071}.meta{display:flex;gap:18px;flex-wrap:wrap}
+    section,.day{border:1px solid #d8dee8;padding:16px;margin:0 0 16px;break-inside:avoid}.plan{display:grid;grid-template-columns:120px 1fr;gap:8px 14px}.plan strong{color:#526071}
+    ul{margin:0;padding-left:22px}.day-head{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid #e5e9f0;padding-bottom:10px;margin-bottom:8px}.item{display:grid;grid-template-columns:88px 1fr;gap:12px;padding:10px 0;border-top:1px solid #eef1f5}.item:first-of-type{border-top:0}.time{font-weight:800;color:#0f4c81}.place{font-weight:800}
+    footer{margin-top:28px;color:#687588;font-size:13px;text-align:center}@media(max-width:640px){body{margin:20px auto;padding:0 14px}.plan,.item{grid-template-columns:1fr}.day-head{display:block}}@media print{body{margin:0;max-width:none;padding:0}footer{display:none}}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>${escapeHtml(itinerary.title || `${destination}行程表`)}</h1>
+    <div class="subtitle">${escapeHtml(itinerary.subtitle || '')}</div>
+    <div class="meta"><span>目的地：${escapeHtml(destination)}</span><span>日期：${escapeHtml(startDate || '未指定')} 至 ${escapeHtml(endDate || '未指定')}</span></div>
+  </header>
+  ${downloadListHtml('需求摘要', itinerary.summary)}
+  ${selectedPlan.length ? `<section><h2>已選方案</h2><div class="plan">${selectedPlan.map(item => `<strong>${escapeHtml(item.label || '')}</strong><span>${escapeHtml(item.value || '')}</span>`).join('')}</div></section>` : ''}
+  <section>
+    <h2>每日行程</h2>
+    ${days.map((day, dayIndex) => {
+      const items = Array.isArray(day.items) ? day.items : [];
+      return `<div class="day"><div class="day-head"><h3>${escapeHtml(day.day || `Day ${dayIndex + 1}`)}｜${escapeHtml(day.title || '彈性行程')}</h3><span>${escapeHtml(day.date || '')}</span></div>${items.map(item => `<div class="item"><div class="time">${escapeHtml(item.time || '')}</div><div><div class="place">${escapeHtml(item.place || '')}</div><div class="note">${escapeHtml(item.note || '')}</div></div></div>`).join('') || '<div class="note">這天保留彈性活動。</div>'}</div>`;
+    }).join('') || '<div class="note">目前沒有每日行程。</div>'}
+  </section>
+  ${downloadListHtml('預算提醒', itinerary.budget_notes)}
+  ${downloadListHtml('交通提醒', itinerary.transport_tips)}
+  ${downloadListHtml('風險提醒', itinerary.risk_tips)}
+  <footer>由 AI 協作式旅遊規劃平台產生，實際行程請依現場狀況彈性調整。</footer>
+</body>
+</html>`;
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${safeFileName}.html`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+    function handleItineraryDragStart(event, dayIndex, itemIndex) {
+      draggedItineraryItem = { dayIndex, itemIndex };
+      event.currentTarget.classList.add('dragging');
+      event.dataTransfer.effectAllowed = 'move';
+    }
+    function handleItineraryDragEnd(event) {
+      event.currentTarget.classList.remove('dragging');
+      document.querySelectorAll('.drag-over').forEach(item => item.classList.remove('drag-over'));
+    }
+    function handleItineraryDragOver(event) {
+      event.preventDefault();
+      event.currentTarget.classList.add('drag-over');
+      event.dataTransfer.dropEffect = 'move';
+    }
+    function handleItineraryDragLeave(event) {
+      event.currentTarget.classList.remove('drag-over');
+    }
+    function handleItineraryDrop(event, targetDayIndex, targetItemIndex) {
+      event.preventDefault();
+      event.currentTarget.classList.remove('drag-over');
+      if (!draggedItineraryItem || !state.itinerary?.days) return;
+      const sourceDay = state.itinerary.days[draggedItineraryItem.dayIndex];
+      const targetDay = state.itinerary.days[targetDayIndex];
+      if (!sourceDay?.items || !targetDay?.items) return;
+      const [movedItem] = sourceDay.items.splice(draggedItineraryItem.itemIndex, 1);
+      if (!movedItem) return;
+      let insertIndex = targetItemIndex;
+      if (draggedItineraryItem.dayIndex === targetDayIndex && draggedItineraryItem.itemIndex < targetItemIndex) {
+        insertIndex -= 1;
+      }
+      targetDay.items.splice(Math.max(0, insertIndex), 0, movedItem);
+      draggedItineraryItem = null;
+      renderItinerary(state.itinerary);
+    }
+    function handleItineraryDropAtEnd(event, targetDayIndex) {
+      event.preventDefault();
+      event.currentTarget.classList.remove('drag-over');
+      if (!draggedItineraryItem || !state.itinerary?.days) return;
+      const sourceDay = state.itinerary.days[draggedItineraryItem.dayIndex];
+      const targetDay = state.itinerary.days[targetDayIndex];
+      if (!sourceDay?.items || !targetDay?.items) return;
+      const [movedItem] = sourceDay.items.splice(draggedItineraryItem.itemIndex, 1);
+      if (!movedItem) return;
+      targetDay.items.push(movedItem);
+      draggedItineraryItem = null;
+      renderItinerary(state.itinerary);
+    }
     function renderDay(day, index) {
       const items = Array.isArray(day?.items) ? day.items : [];
       return `
@@ -2680,8 +3008,14 @@ HTML = r"""<!doctype html>
             <div class="day-date">${escapeHtml(day?.date || '')}</div>
           </div>
           <div class="timeline">
-            ${items.map(item => `
-              <div class="timeline-item">
+            ${items.map((item, itemIndex) => `
+              <div class="timeline-item" draggable="true"
+                ondragstart="handleItineraryDragStart(event, ${index}, ${itemIndex})"
+                ondragend="handleItineraryDragEnd(event)"
+                ondragover="handleItineraryDragOver(event)"
+                ondragleave="handleItineraryDragLeave(event)"
+                ondrop="handleItineraryDrop(event, ${index}, ${itemIndex})">
+                <div class="drag-handle" title="拖拉調整順序">⋮⋮</div>
                 <div class="time-chip">${escapeHtml(item.time || '')}</div>
                 <div>
                   <div class="place">${escapeHtml(item.place || '')}</div>
@@ -2689,6 +3023,12 @@ HTML = r"""<!doctype html>
                 </div>
               </div>
             `).join('') || '<div class="status">這天保留彈性活動。</div>'}
+            <div class="timeline-drop-zone"
+              ondragover="handleItineraryDragOver(event)"
+              ondragleave="handleItineraryDragLeave(event)"
+              ondrop="handleItineraryDropAtEnd(event, ${index})">
+              拖到這裡，放在本日最後
+            </div>
           </div>
         </section>
       `;
@@ -2696,8 +3036,12 @@ HTML = r"""<!doctype html>
     function renderItinerary(data) {
       if (!data || typeof data === 'string') {
         const text = cleanItineraryText(data);
+        state.itinerary = data;
         $('itinerary').innerHTML = `
-          <h2>行程建議</h2>
+          <div class="itinerary-toolbar">
+            <h2>行程建議</h2>
+            <button class="download-itinerary-button" onclick="downloadItinerary()">下載行程表</button>
+          </div>
           <div class="itinerary-layout">
             <section class="itinerary-hero">
               <h3>完整行程建議</h3>
@@ -2708,9 +3052,13 @@ HTML = r"""<!doctype html>
         setTab('itinerary');
         return;
       }
+      state.itinerary = data;
       const days = Array.isArray(data.days) ? data.days : [];
       $('itinerary').innerHTML = `
-        <h2>行程建議</h2>
+        <div class="itinerary-toolbar">
+          <h2>行程建議</h2>
+          <button class="download-itinerary-button" onclick="downloadItinerary()">下載行程表</button>
+        </div>
         <div class="itinerary-layout">
           <section class="itinerary-hero">
             <h3>${escapeHtml(data.title || '完整行程建議')}</h3>
@@ -2722,6 +3070,7 @@ HTML = r"""<!doctype html>
           </div>
           <section class="info-block">
             <h3>每日行程</h3>
+            <div class="itinerary-edit-hint">可拖拉每個行程節點左側的 ⋮⋮ 調整順序，也能拖到其他天；拖到每日底部可放在該日最後。修改只會在前端完成，不會額外消耗 LLM token。</div>
             <div class="itinerary-layout">${days.map(renderDay).join('') || '<div class="status">目前沒有每日行程。</div>'}</div>
           </section>
           <div class="itinerary-grid">

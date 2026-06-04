@@ -206,7 +206,7 @@ Rules:
 1. Return JSON only. Do not return Markdown or code fences.
 2. If information is unclear, use null or an empty array.
 3. Convert all money amounts to integer TWD.
-4. If the user says per-person flight budget, fill flight_preferences.flight_budget_twd_per_person.
+4. flight_preferences.flight_budget_twd_per_person means the maximum budget for one passenger's outbound one-way flight, not a round-trip fare.
 5. If the user says hotel budget per night, fill hotel_preferences.hotel_budget_twd_per_night. If the user says total hotel budget, fill hotel_preferences.hotel_budget_twd_total.
 6. If the user says total trip budget, fill both budget_twd and total_budget_twd.
 7. Flight transfer preference: direct only => prefer_direct=true and max_transfer_count=0; one transfer allowed => prefer_direct=false and max_transfer_count=1; no preference => prefer_direct=false and max_transfer_count=null.

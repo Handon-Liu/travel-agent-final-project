@@ -84,7 +84,7 @@ def _build_no_flight_message(origin, destination, departure_date, budget_per_per
 
     if budget_per_person:
         parts.append(
-            f"目前設定的每人機票預算約 TWD {_format_twd(budget_per_person)}，可能低於這段航線或日期的實際票價。"
+            f"目前設定的每人單程機票預算約 TWD {_format_twd(budget_per_person)}，可能低於這段航線或日期的實際票價。"
         )
 
     if max_connections == 0:
@@ -92,7 +92,7 @@ def _build_no_flight_message(origin, destination, departure_date, budget_per_per
     elif max_connections is not None:
         parts.append(f"目前最多接受轉機 {max_connections} 次，這也可能讓可選航班變少。")
 
-    parts.append("建議提高每人機票預算、放寬轉機限制，或改查其他出發日期。")
+    parts.append("建議提高每人單程機票預算、放寬轉機限制，或改查其他出發日期。")
     return "".join(parts)
 
 
@@ -113,7 +113,7 @@ def _dataframe_to_options(df) -> list[dict]:
             f"抵達：{_format_datetime(row.get('arrival_time'))}；"
             f"轉機：{stops} 次；"
             f"飛行時間：約 {duration_min} 分鐘；"
-            f"票價：總價 TWD {price_twd}，平均每人 TWD {price_per_person_twd}；"
+            f"票價：單程總價 TWD {price_twd}，單程每人 TWD {price_per_person_twd}；"
             f"推薦原因：{reason}"
         )
         bullets = [
