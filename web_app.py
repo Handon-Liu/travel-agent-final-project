@@ -639,7 +639,7 @@ def search_places_for_restaurants(query: str, state=None):
         included_type = "cafe"
     elif any(keyword in lower_query for keyword in ["甜點", "蛋糕", "麵包", "bakery", "dessert"]):
         included_type = "bakery"
-    destination_center, location_parameters = _destination_search_context(destination)
+    destination_center, location_parameters = _destination_search_context(destination, bias_radius_m=15000)
     request_payload = {
         "textQuery": search_text,
         "languageCode": "zh-TW",
@@ -673,6 +673,7 @@ def search_places_for_restaurants(query: str, state=None):
     places = _filter_places_near_destination(
         response.json().get("places") or [],
         destination_center,
+        max_distance_km=50,
     )
     options = normalize_restaurant_options(places, destination, limit=20)
     if len(options) < 20 and destination and included_type == "restaurant":
@@ -699,6 +700,7 @@ def search_places_for_restaurants(query: str, state=None):
                 fallback_places = _filter_places_near_destination(
                     fallback_response.json().get("places") or [],
                     destination_center,
+                    max_distance_km=50,
                 )
                 for option in normalize_restaurant_options(fallback_places, destination, limit=20):
                     if option.get("title") not in seen:
@@ -2467,7 +2469,7 @@ HTML = r"""<!doctype html>
           <input id="manualAttractionQuery" type="text" placeholder="輸入想去的景點，例如：太宰府天滿宮、博多運河城、海邊咖啡廳">
           <button onclick="searchManualAttraction()">搜尋景點</button>
         </div>
-        <div class="activity-search-hint">可以即時搜尋你自己想去的地點，搜尋結果會變成同款卡片，勾選後一起加入後續行程。</div>
+        <div class="activity-search-hint">可以即時搜尋你自己想去的地點；已加入行程的景點會固定保留在畫面中，未加入的原推薦會在搜尋時收起。</div>
         <div class="activity-grid">${cards || '<div class="status">目前沒有可選景點。</div>'}</div>
         <div class="action-row"><button class="secondary" onclick="confirmMultiSelection('activity')">確認景點，前往美食推薦</button></div>
       `;
@@ -2503,7 +2505,8 @@ HTML = r"""<!doctype html>
             merged.push(option);
           }
         }
-        renderActivityOptions(result.description || $('activity')._description || '以下是景點搜尋結果：', merged, selectedKeys);
+        const keepText = selectedItems.length ? `已保留 ${selectedItems.length} 個已加入行程的景點。` : '尚未加入行程的原推薦會暫時收起。';
+        renderActivityOptions(`${result.description || $('activity')._description || '以下是景點搜尋結果：'}\n${keepText}`, merged, selectedKeys);
         $('manualAttractionQuery').value = originalText;
       } catch (err) {
         alert(err.message || '搜尋景點失敗。');
